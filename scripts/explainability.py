@@ -53,9 +53,15 @@ def _fix_xgboost_base_score(model: Any) -> None:
 def shap_explain(model: Any, X_train: np.ndarray, X_test: np.ndarray,
                  feature_names: Optional[List[str]] = None,
                  max_display: int = 20,
-                 save_path: Optional[str] = None) -> tuple:
+                 save_path: Optional[str] = None,
+                 n_samples: Optional[int] = None) -> tuple:  # Add n_samples parameter
     """
     Generate SHAP explanations for the model.
+    
+    Parameters:
+    -----------
+    n_samples : int, optional
+        Number of test samples to use. If None, uses min(500, X_test.shape[0])
     """
     print("\n" + "="*60)
     print("SHAP EXPLAINABILITY ANALYSIS")
@@ -80,10 +86,15 @@ def shap_explain(model: Any, X_train: np.ndarray, X_test: np.ndarray,
         explainer = shap.KernelExplainer(model.predict_proba, background)
         print("  KernelExplainer created successfully.")
 
-    # --- Compute SHAP values ---
-    test_sample_size = min(500, X_test.shape[0])
+    # --- Compute SHAP values with configurable sample size ---
+    if n_samples is None:
+        test_sample_size = min(500, X_test.shape[0])  # Default: 500
+    else:
+        test_sample_size = min(n_samples, X_test.shape[0])  # User-specified, capped at available data
+    
     X_test_sample = X_test[:test_sample_size]
 
+    
     print(f"  Computing SHAP values for {test_sample_size} samples...")
 
     if isinstance(explainer, shap.KernelExplainer):

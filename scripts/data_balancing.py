@@ -6,6 +6,7 @@ import tensorflow as tf
 import joblib
 import os
 from sklearn.preprocessing import MinMaxScaler
+from imblearn.under_sampling import EditedNearestNeighbours
 from gan_util import split_num_cat, combine_num_cat
 from cwgan_gp import CWGANGP
 
@@ -20,14 +21,13 @@ def prepare_minority_data_for_gan(df, feature_info, target_col='Class', minority
     else:
         num_scaled = num_raw
     return (num_scaled, cat_list), scaler, df_min
-# Add this new function to data_balancing.py
+
 
 def prepare_full_data_for_gan(df, feature_info, target_col='Class', minority_label=1, batch_size=64):
     """
     Prepare full dataset (both classes) for cWGAN-GP training with conditioning.
     Returns a tf.data.Dataset yielding (real_data_tuple, cond, labels).
     """
-    # Split into numerical and categorical
     num_raw, cat_list, _ = split_num_cat(df, feature_info)
     scaler = MinMaxScaler()
     if num_raw.shape[1] > 0:
@@ -38,7 +38,6 @@ def prepare_full_data_for_gan(df, feature_info, target_col='Class', minority_lab
     n_num = num_scaled.shape[1]
     n_cat_dims = [arr.shape[1] for arr in cat_list]
 
-    # Condition: binary indicator for minority class (1 = minority, 0 = majority)
     cond = (df[target_col] == minority_label).astype(np.float32).values.reshape(-1, 1)
     labels = df[target_col].astype(np.float32).values.reshape(-1, 1)
 
@@ -104,9 +103,20 @@ def train_cwgan_on_minority(df_processed, feature_info, target_col='Class', mino
 
 def train_cwgan_full(df_train, feature_info, target_col='Class', minority_label=1,
                      latent_dim=256, epochs=3000, batch_size=64, n_critic=5,
-                     gp_weight=10.0, aux_weight=1.0, learning_rate=1e-4, gumbel_temperature=0.5,
-                     early_stopping_patience=50, verbose=True, save_path='models/cwgan_full/'):
-    """Train cWGAN-GP on full dataset with conditioning and auxiliary classifier."""
+                     gp_weight=10.0, aux_weight=1.0, 
+                     learning_rate=1e-4, critic_learning_rate=None, gen_learning_rate=None,
+                     gumbel_temperature=0.5, use_cross_layers=True,
+                     early_stopping_patience=2000, verbose=True, save_path='models/cwgan_full/',
+                     use_lr_scheduling=False, restore_best=True):
+    """
+    Train cWGAN-GP on full dataset with conditioning and auxiliary classifier.
+    
+    Args:
+        critic_learning_rate: Separate LR for critic (if None, uses learning_rate)
+        gen_learning_rate: Separate LR for generator (if None, uses learning_rate)
+        use_lr_scheduling: Whether to use exponential learning rate decay
+        restore_best: Whether to restore best model at early stopping
+    """
     dataset, scaler, n_num, n_cat_dims, _, _ = prepare_full_data_for_gan(
         df_train, feature_info, target_col, minority_label, batch_size
     )
@@ -116,82 +126,104 @@ def train_cwgan_full(df_train, feature_info, target_col='Class', minority_label=
         latent_dim=latent_dim, cond_dim=1,
         gen_hidden=[256, 256], critic_hidden=[256, 256],
         gp_weight=gp_weight, aux_weight=aux_weight,
-        learning_rate=learning_rate, gumbel_temperature=gumbel_temperature,
-        use_cross_layers=True
+        learning_rate=learning_rate,
+        critic_learning_rate=critic_learning_rate,
+        gen_learning_rate=gen_learning_rate,
+        gumbel_temperature=gumbel_temperature,
+        use_cross_layers=use_cross_layers,
+        use_lr_scheduling=use_lr_scheduling
     )
 
     gan.train(dataset, epochs=epochs, n_critic=n_critic, verbose=verbose,
-              early_stopping_patience=early_stopping_patience)
+              early_stopping_patience=early_stopping_patience, restore_best=restore_best)
 
     gan.save(save_path)
     joblib.dump(scaler, os.path.join(save_path, 'scaler.pkl'))
     print(f"Model saved to {save_path}")
     return gan, scaler
 
+
 def generate_synthetic_samples(gan, scaler, n_samples, feature_info, columns_order,
                                minority_label=1, target_col='Class', feature_ranges=None):
+    """Generate n_samples synthetic minority samples."""
     cond = np.ones((n_samples, 1), dtype=np.float32)
     num_gen_scaled, cat_gen = gan.generate(cond, batch_size=64)
 
     if num_gen_scaled is not None:
         num_gen = scaler.inverse_transform(num_gen_scaled)
-        
-        # Clip to original ranges if provided
         if feature_ranges is not None:
             for i, col in enumerate(feature_info['numerical']):
                 min_val, max_val = feature_ranges[col]
                 num_gen[:, i] = np.clip(num_gen[:, i], min_val, max_val)
-        
-        # --- ENFORCE INTEGER TYPES FOR DISCRETE FEATURES ---
-        # Define which numerical columns should be integers
         integer_cols = ['Duration', 'CreditAmount', 'Age']
         for col in integer_cols:
             if col in feature_info['numerical']:
                 idx = feature_info['numerical'].index(col)
-                # Round to nearest integer and cast to int
                 num_gen[:, idx] = np.round(num_gen[:, idx]).astype(int)
-        # ----------------------------------------------------
     else:
         num_gen = None
 
     df_synth = combine_num_cat(num_gen, cat_gen, feature_info, columns_order)
-    
-    # Ensure categorical one-hot columns are int
     for cat_name, cols in feature_info['categorical'].items():
         for col in cols:
             if col in df_synth.columns:
                 df_synth[col] = df_synth[col].astype(int)
-    # Ensure numerical columns are float (Credit_per_Duration stays float)
     for col in feature_info['numerical']:
         if col in df_synth.columns and col not in integer_cols:
             df_synth[col] = df_synth[col].astype(float)
-    
+
     df_synth[target_col] = minority_label
     return df_synth
 
 
-def balance_dataset_with_cwgan(df_processed, feature_info, target_col='Class',
-                               minority_label=1, gan_path='models/cwgan/',
-                               column_order_path='models/column_order.pkl',
-                               feature_ranges=None):
-    """Load trained GAN and generate enough synthetic samples to balance the given DataFrame."""
-    gan = CWGANGP.load(gan_path)
-    scaler = joblib.load(os.path.join(gan_path, 'scaler.pkl'))
-    column_order = joblib.load(column_order_path)
-
-    majority_count = (df_processed[target_col] != minority_label).sum()
-    minority_count = (df_processed[target_col] == minority_label).sum()
+def generate_and_clean_synthetic_samples(gan, scaler, feature_info, columns_order,
+                                         df_train_imb, target_col='Class', minority_label=1,
+                                         factor=2.0, n_neighbors=3):
+    """
+    Generate factor * needed synthetic samples, combine with imbalanced training set,
+    then apply Edited Nearest Neighbours (ENN) to remove ambiguous/overlapping samples.
+    """
+    majority_count = (df_train_imb[target_col] != minority_label).sum()
+    minority_count = (df_train_imb[target_col] == minority_label).sum()
     needed = majority_count - minority_count
-    print(f"Majority: {majority_count}, Minority: {minority_count}, Need {needed} synthetic samples.")
-
+    
     if needed <= 0:
-        print("Dataset already balanced.")
-        return df_processed
-
-    df_synth = generate_synthetic_samples(
-        gan, scaler, needed, feature_info, column_order,
-        minority_label, target_col, feature_ranges
+        print("Dataset already balanced. No generation needed.")
+        return df_train_imb
+    
+    n_generate = int(needed * factor)
+    print(f"Generating {n_generate} synthetic samples ({factor}x needed = {needed})")
+    
+    feature_ranges = {
+        col: (df_train_imb[col].min(), df_train_imb[col].max()) 
+        for col in feature_info['numerical']
+    }
+    
+    df_synth_excess = generate_synthetic_samples(
+        gan, scaler, n_generate, feature_info, columns_order,
+        minority_label=minority_label, target_col=target_col,
+        feature_ranges=feature_ranges
     )
-
-    df_balanced = pd.concat([df_processed, df_synth], ignore_index=True)
+    
+    df_combined = pd.concat([df_train_imb, df_synth_excess], ignore_index=True)
+    print(f"Combined shape: {df_combined.shape} (original + excess synthetic)")
+    
+    X_temp = df_combined.drop(columns=[target_col])
+    y_temp = df_combined[target_col]
+    
+    enn = EditedNearestNeighbours(
+        sampling_strategy='all',
+        n_neighbors=n_neighbors,
+        kind_sel='all'
+    )
+    
+    X_clean, y_clean = enn.fit_resample(X_temp, y_temp)
+    df_balanced = pd.concat([X_clean, y_clean], axis=1)
+    
+    final_majority = (df_balanced[target_col] != minority_label).sum()
+    final_minority = (df_balanced[target_col] == minority_label).sum()
+    print(f"\nAfter ENN cleaning:")
+    print(f"  Majority: {final_majority}, Minority: {final_minority}")
+    print(f"  Final balance ratio: {final_majority/final_minority:.2f}:1")
+    
     return df_balanced

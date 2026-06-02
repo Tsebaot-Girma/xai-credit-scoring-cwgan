@@ -78,8 +78,10 @@ def _to_tuple(x):
 class CWGANGP:
     def __init__(self, n_num, n_cat_dims, latent_dim=256, cond_dim=1,
                  gen_hidden=[256, 256], critic_hidden=[256, 256],
-                 gp_weight=10.0, aux_weight=1.0, learning_rate=1e-4,
-                 gumbel_temperature=0.5, use_cross_layers=True):
+                 gp_weight=10.0, aux_weight=1.0, 
+                 learning_rate=1e-4, critic_learning_rate=None, gen_learning_rate=None,
+                 gumbel_temperature=0.5, use_cross_layers=True,
+                 use_lr_scheduling=False):
         self.n_num = n_num
         self.n_cat_dims = n_cat_dims
         self.n_cat_groups = len(n_cat_dims)
@@ -89,17 +91,43 @@ class CWGANGP:
         self.aux_weight = aux_weight
         self.gumbel_temperature = gumbel_temperature
         self.use_cross_layers = use_cross_layers
+        self.use_lr_scheduling = use_lr_scheduling
 
         self.generator = self._build_generator(gen_hidden)
         self.critic = self._build_critic(critic_hidden)
 
-        self.gen_optimizer = keras.optimizers.Adam(learning_rate=learning_rate, beta_1=0.5, beta_2=0.9)
-        self.critic_optimizer = keras.optimizers.Adam(learning_rate=learning_rate, beta_1=0.5, beta_2=0.9)
+        # Allow separate learning rates for critic and generator
+        critic_lr = critic_learning_rate if critic_learning_rate is not None else learning_rate
+        gen_lr = gen_learning_rate if gen_learning_rate is not None else learning_rate
+        
+        if use_lr_scheduling:
+            self.critic_lr_schedule = keras.optimizers.schedules.ExponentialDecay(
+                initial_learning_rate=critic_lr,
+                decay_steps=1000,
+                decay_rate=0.95
+            )
+            self.gen_lr_schedule = keras.optimizers.schedules.ExponentialDecay(
+                initial_learning_rate=gen_lr,
+                decay_steps=1000,
+                decay_rate=0.95
+            )
+            self.gen_optimizer = keras.optimizers.Adam(learning_rate=self.gen_lr_schedule, beta_1=0.5, beta_2=0.9)
+            self.critic_optimizer = keras.optimizers.Adam(learning_rate=self.critic_lr_schedule, beta_1=0.5, beta_2=0.9)
+        else:
+            self.gen_optimizer = keras.optimizers.Adam(learning_rate=gen_lr, beta_1=0.5, beta_2=0.9)
+            self.critic_optimizer = keras.optimizers.Adam(learning_rate=critic_lr, beta_1=0.5, beta_2=0.9)
 
         self.g_losses = []
         self.c_losses = []
         self.w_distances = []
         self.gp_vals = []
+        
+        # For tracking best model
+        self.best_generator_weights = None
+        self.best_critic_weights = None
+        self.best_g_loss = float('inf')
+        self.best_w_dist = -float('inf')
+        self.best_epoch = 0
 
     def _build_generator(self, hidden_units):
         noise = layers.Input(shape=(self.latent_dim,))
@@ -218,6 +246,8 @@ class CWGANGP:
             c_loss_total = c_loss + self.gp_weight * gp + self.aux_weight * aux_loss
 
         critic_grads = critic_tape.gradient(c_loss_total, self.critic.trainable_variables)
+        # Gradient clipping for stability
+        critic_grads, _ = tf.clip_by_global_norm(critic_grads, 1.0)
         self.critic_optimizer.apply_gradients(zip(critic_grads, self.critic.trainable_variables))
 
         # --- Train Generator ---
@@ -233,14 +263,23 @@ class CWGANGP:
             g_total_loss = g_loss + self.aux_weight * aux_loss_g
 
         gen_grads = gen_tape.gradient(g_total_loss, self.generator.trainable_variables)
+        # Gradient clipping for stability
+        gen_grads, _ = tf.clip_by_global_norm(gen_grads, 1.0)
         self.gen_optimizer.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
 
         w_dist = tf.reduce_mean(real_score) - tf.reduce_mean(fake_score)
         return c_loss, g_loss, w_dist, gp
 
-    def train(self, dataset, epochs, n_critic=5, verbose=True, early_stopping_patience=50):
-        best_w_dist = -np.inf
+    def train(self, dataset, epochs, n_critic=5, verbose=True, early_stopping_patience=50,
+            restore_best=True):
+        # Initialize with first epoch's loss instead of -inf
+        best_g_loss = None  # ← CHANGED: Start with None
         patience_counter = 0
+        best_epoch = 0
+        
+        # Store best weights
+        best_generator_weights = None
+        best_critic_weights = None
 
         for epoch in range(epochs):
             epoch_c_loss = 0.0
@@ -269,22 +308,48 @@ class CWGANGP:
             self.w_distances.append(epoch_w_dist)
             self.gp_vals.append(epoch_gp)
 
-            if verbose and (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch+1}/{epochs} | C Loss: {epoch_c_loss:.4f} | G Loss: {epoch_g_loss:.4f} | "
-                      f"W Dist: {epoch_w_dist:.4f} | GP: {epoch_gp:.4f}")
-
-            if epoch_w_dist > best_w_dist:
-                best_w_dist = epoch_w_dist
+            # ← FIXED: Initialize best_g_loss on first epoch
+            if best_g_loss is None:
+                best_g_loss = epoch_g_loss
+                best_epoch = epoch + 1
+                if restore_best:
+                    best_generator_weights = self.generator.get_weights()
+                    best_critic_weights = self.critic.get_weights()
+                if verbose:
+                    print(f"  ✓ Initial best generator loss: {epoch_g_loss:.4f} at epoch {epoch+1}")
+            # Track best generator loss (more negative = better)
+            elif epoch_g_loss < best_g_loss:  # < because more negative is better
+                best_g_loss = epoch_g_loss
                 patience_counter = 0
+                best_epoch = epoch + 1
+                if restore_best:
+                    best_generator_weights = self.generator.get_weights()
+                    best_critic_weights = self.critic.get_weights()
+                if verbose:
+                    print(f"  ✓ New best generator loss: {epoch_g_loss:.4f} at epoch {epoch+1}")
             else:
                 patience_counter += 1
 
+            # Only print progress every 10 epochs
+            if verbose and (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch+1}/{epochs} | C Loss: {epoch_c_loss:.4f} | G Loss: {epoch_g_loss:.4f} | "
+                    f"W Dist: {epoch_w_dist:.4f} | GP: {epoch_gp:.4f} | Best G Loss: {best_g_loss:.4f}")
+
+            # Early stopping check
             if patience_counter >= early_stopping_patience:
                 print(f"\nEarly stopping at epoch {epoch+1} "
-                      f"(Wasserstein distance did not improve for {early_stopping_patience} epochs)")
+                    f"(Generator loss did not improve for {early_stopping_patience} epochs)")
+                if restore_best and best_generator_weights is not None:
+                    self.generator.set_weights(best_generator_weights)
+                    self.critic.set_weights(best_critic_weights)
+                    print(f"Restored best model from epoch {best_epoch} (Best G Loss: {best_g_loss:.4f})")
                 break
 
-        print(f"\nTraining completed! Best Wasserstein Distance: {best_w_dist:.4f}")
+        print(f"\nTraining completed! Best Generator Loss: {best_g_loss:.4f} at epoch {best_epoch}")
+        
+        # Store best metrics for later reference
+        self.best_g_loss = best_g_loss
+        self.best_epoch = best_epoch
 
     def generate(self, cond, batch_size=32):
         n_samples = cond.shape[0]
@@ -331,14 +396,18 @@ class CWGANGP:
             'gp_weight': self.gp_weight,
             'aux_weight': self.aux_weight,
             'gumbel_temperature': self.gumbel_temperature,
-            'use_cross_layers': self.use_cross_layers
+            'use_cross_layers': self.use_cross_layers,
+            'best_g_loss': self.best_g_loss,
+            'best_epoch': self.best_epoch
         }
         joblib.dump(meta, os.path.join(path, 'meta.pkl'))
         losses = {
             'c_losses': self.c_losses,
             'g_losses': self.g_losses,
             'w_distances': self.w_distances,
-            'gp_vals': self.gp_vals
+            'gp_vals': self.gp_vals,
+            'best_g_loss': self.best_g_loss,
+            'best_epoch': self.best_epoch
         }
         joblib.dump(losses, os.path.join(path, 'losses.pkl'))
 
@@ -368,4 +437,6 @@ class CWGANGP:
         gan.g_losses = losses['g_losses']
         gan.w_distances = losses['w_distances']
         gan.gp_vals = losses['gp_vals']
+        gan.best_g_loss = losses.get('best_g_loss', None)
+        gan.best_epoch = losses.get('best_epoch', None)
         return gan

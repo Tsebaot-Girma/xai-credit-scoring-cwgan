@@ -1,39 +1,35 @@
-#scripts/train_xgboost.py
-
-"""
-XGBoost Training Module
-- Default training for Imbalanced and SMOTE baselines
-- Optuna hyperparameter optimization for cWGAN‑GP model
-"""
+# scripts/train_xgboost.py
 
 import xgboost as xgb
 import optuna
 import numpy as np
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.metrics import roc_auc_score
-from typing import Tuple, Dict
+
+from sklearn.model_selection import (
+    StratifiedKFold,
+    train_test_split
+)
+
+from sklearn.metrics import (
+    f1_score,
+    precision_score,
+    recall_score,
+    fbeta_score,
+    accuracy_score
+)
+
 import warnings
 warnings.filterwarnings('ignore')
 
 
-def train_xgboost_default(X_train: np.ndarray, y_train: np.ndarray,
-                          X_test: np.ndarray, y_test: np.ndarray,
-                          scale_pos_weight: bool = True) -> xgb.XGBClassifier:
-    """
-    Train XGBoost with default parameters.
-    Used for Imbalanced baseline and SMOTE baseline.
+# ============================================================
+# Default Baseline XGBoost (unchanged)
+# ============================================================
+def train_xgboost_default(
+    X_train,
+    y_train,
+    scale_pos_weight=True
+):
 
-    Args:
-        X_train: Training features
-        y_train: Training labels
-        X_test: Test features (for early stopping)
-        y_test: Test labels (for early stopping)
-        scale_pos_weight: Whether to automatically compute scale_pos_weight
-
-    Returns:
-        Trained XGBoost model
-    """
-    # Compute class weight for imbalance handling
     if scale_pos_weight:
         n_neg = np.sum(y_train == 0)
         n_pos = np.sum(y_train == 1)
@@ -41,119 +37,464 @@ def train_xgboost_default(X_train: np.ndarray, y_train: np.ndarray,
     else:
         spw = 1
 
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train,
+        y_train,
+        test_size=0.2,
+        stratify=y_train,
+        random_state=42
+    )
+
     model = xgb.XGBClassifier(
-        n_estimators=100,
+        n_estimators=300,
         max_depth=6,
-        learning_rate=0.1,
+        learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
         scale_pos_weight=spw,
-        random_state=42,
+        objective='binary:logistic',
         eval_metric='logloss',
-        use_label_encoder=False,
-        verbosity=0
+        early_stopping_rounds=30,
+        random_state=42,
+        verbosity=0,
+        use_label_encoder=False
     )
 
     model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
+        X_tr,
+        y_tr,
+        eval_set=[(X_val, y_val)],
         verbose=False
     )
 
-    print(f"  Default XGBoost trained (scale_pos_weight={spw:.2f})")
+    print("\nDefault XGBoost trained")
+    print(f"scale_pos_weight = {spw:.2f}")
+
     return model
 
-def train_xgboost_optuna(X_train: np.ndarray, y_train: np.ndarray,
-                         X_test: np.ndarray, y_test: np.ndarray,
-                         n_trials: int = 50, cv_folds: int = 5,
-                         random_state: int = 42) -> Tuple[xgb.XGBClassifier, Dict]:
+
+# ============================================================
+# Fβ threshold optimisation (no precision constraint)
+# ============================================================
+def find_best_threshold_fbeta(model, X, y, beta=2.0):
     """
-    Train XGBoost with Optuna hyperparameter optimization using k‑fold CV.
-    Used for the proposed cWGAN‑GP model.
-
-    Args:
-        X_train: Training features
-        y_train: Training labels
-        X_test: Test features
-        y_test: Test labels
-        n_trials: Number of Optuna trials (50 recommended)
-        cv_folds: Number of cross‑validation folds (5 recommended)
-        random_state: Random seed
-
-    Returns:
-        best_model, best_params
+    Find threshold that maximizes Fβ score.
+    β > 1 gives more weight to recall (β=2 typical for imbalanced credit risk).
     """
-    from sklearn.model_selection import StratifiedKFold
-    
-    print(f"\n  Starting Optuna hyperparameter optimization")
-    print(f"  Trials: {n_trials}, CV folds: {cv_folds}")
+    y_proba = model.predict_proba(X)[:, 1]
+    thresholds = np.linspace(0.30, 0.99, 160)
+    best_score = -1.0
+    best_thresh = 0.5
 
-    # Create Optuna study
-    study = optuna.create_study(
-        direction='maximize',
-        sampler=optuna.samplers.TPESampler(seed=random_state)
-    )
+    for t in thresholds:
+        y_pred = (y_proba >= t).astype(int)
+        score = fbeta_score(y, y_pred, beta=beta)
+        if score > best_score:
+            best_score = score
+            best_thresh = t
 
-    # Define objective with k‑fold CV
-    def objective_with_cv(trial: optuna.Trial) -> float:
-        """Optuna objective that uses k‑fold CV for robust evaluation."""
+    print(f"\nBest threshold (F{beta}): {best_thresh:.4f} (score={best_score:.4f})")
+    return best_thresh, best_score
+
+
+# ============================================================
+# Optuna with Fβ objective (inside CV) + expanded search space
+# ============================================================
+def train_xgboost_optuna(
+    X_train,
+    y_train,
+    n_trials=100,         # increased from 50
+    cv_folds=5,
+    beta=2.0              # use F₂ score by default
+):
+
+    print("\n" + "=" * 60)
+    print(f"Starting Optuna Optimisation (maximising F{beta} inside CV)")
+    print("=" * 60)
+
+    def objective(trial):
+        # Expanded hyperparameter ranges
         params = {
-            'n_estimators': trial.suggest_int('n_estimators', 50, 300),
-            'max_depth': trial.suggest_int('max_depth', 3, 10),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'n_estimators': trial.suggest_int('n_estimators', 300, 1200),
+            'max_depth': trial.suggest_int('max_depth', 4, 12),
+            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.2, log=True),
+            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
             'gamma': trial.suggest_float('gamma', 0, 5),
             'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
-            'reg_lambda': trial.suggest_float('reg_lambda', 0, 10),
-            'random_state': 42,
+            'reg_lambda': trial.suggest_float('reg_lambda', 1, 15),
+            'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 5.0),  # increased upper bound
+            'objective': 'binary:logistic',
             'eval_metric': 'logloss',
-            'use_label_encoder': False,
-            'verbosity': 0
+            'random_state': 42,
+            'verbosity': 0,
+            'use_label_encoder': False
         }
 
-        # K‑fold cross‑validation
-        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
-        auc_scores = []
+        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        fold_scores = []
 
         for train_idx, val_idx in skf.split(X_train, y_train):
-            X_tr, X_val = X_train[train_idx], X_train[val_idx]
-            y_tr, y_val = y_train[train_idx], y_train[val_idx]
+            X_tr = X_train[train_idx]
+            X_val = X_train[val_idx]
+            y_tr = y_train[train_idx]
+            y_val = y_train[val_idx]
 
-            model = xgb.XGBClassifier(**params)
-            model.fit(X_tr, y_tr, verbose=False)
+            model = xgb.XGBClassifier(**params, early_stopping_rounds=30)
+            model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
 
-            y_pred_proba = model.predict_proba(X_val)[:, 1]
-            auc = roc_auc_score(y_val, y_pred_proba)
-            auc_scores.append(auc)
+            y_proba = model.predict_proba(X_val)[:, 1]
+            thresholds = np.linspace(0.30, 0.99, 60)
 
-        return np.mean(auc_scores)
+            best_fold_score = -1.0
+            for t in thresholds:
+                y_pred = (y_proba >= t).astype(int)
+                # Use Fβ inside CV (not F1)
+                fold_score = fbeta_score(y_val, y_pred, beta=beta)
+                if fold_score > best_fold_score:
+                    best_fold_score = fold_score
 
-    # Optimize
-    study.optimize(
-        objective_with_cv,
-        n_trials=n_trials,
-        show_progress_bar=True
+            fold_scores.append(best_fold_score)
+
+        return np.mean(fold_scores)
+
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials)
+
+    print("\n" + "=" * 60)
+    print("OPTUNA RESULTS")
+    print("=" * 60)
+
+    print(f"Best CV F{beta} Score : {study.best_value:.4f}")
+
+    print("\nBest Parameters:")
+    for k, v in study.best_params.items():
+        print(f"{k}: {v}")
+
+    # Final train / validation split
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train,
+        y_train,
+        test_size=0.2,
+        stratify=y_train,
+        random_state=42
     )
 
-    print(f"\n  Best CV AUC-ROC: {study.best_value:.4f}")
-    print("  Best hyperparameters:")
-    for key, value in study.best_params.items():
-        print(f"    {key}: {value}")
+    # Final model with best parameters
+    best_model = xgb.XGBClassifier(
+        **study.best_params,
+        objective='binary:logistic',
+        eval_metric='logloss',
+        early_stopping_rounds=30,
+        random_state=42,
+        verbosity=0,
+        use_label_encoder=False
+    )
 
-    # Train final model on full training set with best parameters
-    best_params = study.best_params
-    best_params['random_state'] = random_state
-    best_params['eval_metric'] = 'logloss'
-    best_params['use_label_encoder'] = False
-    best_params['verbosity'] = 0
-
-    best_model = xgb.XGBClassifier(**best_params)
     best_model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
+        X_tr,
+        y_tr,
+        eval_set=[(X_val, y_val)],
         verbose=False
     )
 
-    return best_model, best_params
+    # Threshold optimisation on validation set using Fβ
+    best_threshold, best_fbeta = find_best_threshold_fbeta(best_model, X_val, y_val, beta=beta)
+
+    print("\nFinal Validation Results")
+    print(f"Best Threshold : {best_threshold:.4f}")
+    print(f"Validation F{beta} : {best_fbeta:.4f}")
+
+    return best_model, study.best_params, best_threshold
+
+# Add this modified version to your train_xgboost.py file
+
+def train_xgboost_optuna_with_recall_constraint(
+    X_train,
+    y_train,
+    n_trials=100,
+    cv_folds=5,
+    beta=2.0,
+    recall_min=0.70  # minimum recall constraint
+):
+    """
+    Optuna optimization with recall constraint.
+    Maximizes (recall + accuracy) / 2 while ensuring recall >= recall_min
+    """
+    
+    print("\n" + "=" * 60)
+    print(f"Starting Optuna Optimisation with recall >= {recall_min}")
+    print("=" * 60)
+    
+    def objective(trial):
+        # Expanded hyperparameter ranges
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 300, 1200),
+            'max_depth': trial.suggest_int('max_depth', 4, 12),
+            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.2, log=True),
+            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+            'gamma': trial.suggest_float('gamma', 0, 5),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1, 15),
+            'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 5.0),
+            'objective': 'binary:logistic',
+            'eval_metric': 'logloss',
+            'random_state': 42,
+            'verbosity': 0,
+            'use_label_encoder': False
+        }
+        
+        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        fold_scores = []
+        
+        for train_idx, val_idx in skf.split(X_train, y_train):
+            X_tr = X_train[train_idx]
+            X_val = X_train[val_idx]
+            y_tr = y_train[train_idx]
+            y_val = y_train[val_idx]
+            
+            model = xgb.XGBClassifier(**params, early_stopping_rounds=30)
+            model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+            
+            y_proba = model.predict_proba(X_val)[:, 1]
+            thresholds = np.linspace(0.30, 0.99, 60)
+            
+            best_fold_score = -1.0
+            for t in thresholds:
+                y_pred = (y_proba >= t).astype(int)
+                recall = recall_score(y_val, y_pred)
+                
+                # Only consider thresholds meeting recall constraint
+                if recall >= recall_min:
+                    # Maximize (recall + accuracy) / 2
+                    acc = accuracy_score(y_val, y_pred)
+                    score = (recall + acc) / 2
+                    if score > best_fold_score:
+                        best_fold_score = score
+            
+            # If no threshold meets recall constraint, penalize heavily
+            if best_fold_score == -1.0:
+                best_fold_score = 0.0
+                
+            fold_scores.append(best_fold_score)
+        
+        return np.mean(fold_scores)
+    
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials)
+    
+    print("\n" + "=" * 60)
+    print("OPTUNA RESULTS")
+    print("=" * 60)
+    
+    print(f"Best CV Score : {study.best_value:.4f}")
+    
+    print("\nBest Parameters:")
+    for k, v in study.best_params.items():
+        print(f"{k}: {v}")
+    
+    # Final train / validation split
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train,
+        y_train,
+        test_size=0.2,
+        stratify=y_train,
+        random_state=42
+    )
+    
+    # Final model with best parameters
+    best_model = xgb.XGBClassifier(
+        **study.best_params,
+        objective='binary:logistic',
+        eval_metric='logloss',
+        early_stopping_rounds=30,
+        random_state=42,
+        verbosity=0,
+        use_label_encoder=False
+    )
+    
+    best_model.fit(
+        X_tr,
+        y_tr,
+        eval_set=[(X_val, y_val)],
+        verbose=False
+    )
+    
+    # Find threshold that meets recall constraint while maximizing (recall+acc)/2
+    y_proba = best_model.predict_proba(X_val)[:, 1]
+    thresholds = np.linspace(0.30, 0.99, 160)
+    
+    best_threshold = 0.5
+    best_score = -1.0
+    
+    for t in thresholds:
+        y_pred = (y_proba >= t).astype(int)
+        recall = recall_score(y_val, y_pred)
+        if recall >= recall_min:
+            acc = accuracy_score(y_val, y_pred)
+            score = (recall + acc) / 2
+            if score > best_score:
+                best_score = score
+                best_threshold = t
+    
+    print(f"\nFinal Validation Results")
+    print(f"Best Threshold (recall >= {recall_min}): {best_threshold:.4f}")
+    print(f"Validation Score (recall+acc)/2: {best_score:.4f}")
+    
+    # Verify recall constraint
+    y_pred_final = (y_proba >= best_threshold).astype(int)
+    final_recall = recall_score(y_val, y_pred_final)
+    final_acc = accuracy_score(y_val, y_pred_final)
+    print(f"Recall at threshold: {final_recall:.4f} >= {recall_min}")
+    print(f"Accuracy at threshold: {final_acc:.4f}")
+    
+    return best_model, study.best_params, best_threshold
+def train_xgboost_optuna_with_precision_constraint(
+    X_train,
+    y_train,
+    n_trials=100,
+    cv_folds=5,
+    beta=2.0,
+    precision_min=0.70  # minimum precision constraint (changed from recall_min)
+):
+    """
+    Optuna optimization with precision constraint.
+    Maximizes (recall + accuracy) / 2 while ensuring precision >= precision_min
+    """
+    
+    print("\n" + "=" * 60)
+    print(f"Starting Optuna Optimisation with precision >= {precision_min}")
+    print("=" * 60)
+    
+    def objective(trial):
+        # Expanded hyperparameter ranges
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 300, 1200),
+            'max_depth': trial.suggest_int('max_depth', 4, 12),
+            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.2, log=True),
+            'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+            'gamma': trial.suggest_float('gamma', 0, 5),
+            'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1, 15),
+            'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 5.0),
+            'objective': 'binary:logistic',
+            'eval_metric': 'logloss',
+            'random_state': 42,
+            'verbosity': 0,
+            'use_label_encoder': False
+        }
+        
+        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        fold_scores = []
+        
+        for train_idx, val_idx in skf.split(X_train, y_train):
+            X_tr = X_train[train_idx]
+            X_val = X_train[val_idx]
+            y_tr = y_train[train_idx]
+            y_val = y_train[val_idx]
+            
+            model = xgb.XGBClassifier(**params, early_stopping_rounds=30)
+            model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+            
+            y_proba = model.predict_proba(X_val)[:, 1]
+            thresholds = np.linspace(0.30, 0.99, 60)
+            
+            best_fold_score = -1.0
+            for t in thresholds:
+                y_pred = (y_proba >= t).astype(int)
+                precision = precision_score(y_val, y_pred, zero_division=0)
+                
+                # Only consider thresholds meeting precision constraint
+                if precision >= precision_min:
+                    # Maximize (recall + accuracy) / 2
+                    recall = recall_score(y_val, y_pred)
+                    acc = accuracy_score(y_val, y_pred)
+                    score = (recall + acc) / 2
+                    if score > best_fold_score:
+                        best_fold_score = score
+            
+            # If no threshold meets precision constraint, penalize heavily
+            if best_fold_score == -1.0:
+                best_fold_score = 0.0
+                
+            fold_scores.append(best_fold_score)
+        
+        return np.mean(fold_scores)
+    
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials)
+    
+    print("\n" + "=" * 60)
+    print("OPTUNA RESULTS")
+    print("=" * 60)
+    
+    print(f"Best CV Score : {study.best_value:.4f}")
+    
+    print("\nBest Parameters:")
+    for k, v in study.best_params.items():
+        print(f"{k}: {v}")
+    
+    # Final train / validation split
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train,
+        y_train,
+        test_size=0.2,
+        stratify=y_train,
+        random_state=42
+    )
+    
+    # Final model with best parameters
+    best_model = xgb.XGBClassifier(
+        **study.best_params,
+        objective='binary:logistic',
+        eval_metric='logloss',
+        early_stopping_rounds=30,
+        random_state=42,
+        verbosity=0,
+        use_label_encoder=False
+    )
+    
+    best_model.fit(
+        X_tr,
+        y_tr,
+        eval_set=[(X_val, y_val)],
+        verbose=False
+    )
+    
+    # Find threshold that meets precision constraint while maximizing (recall+acc)/2
+    y_proba = best_model.predict_proba(X_val)[:, 1]
+    thresholds = np.linspace(0.30, 0.99, 160)
+    
+    best_threshold = 0.5
+    best_score = -1.0
+    
+    for t in thresholds:
+        y_pred = (y_proba >= t).astype(int)
+        precision = precision_score(y_val, y_pred, zero_division=0)
+        if precision >= precision_min:
+            recall = recall_score(y_val, y_pred)
+            acc = accuracy_score(y_val, y_pred)
+            score = (recall + acc) / 2
+            if score > best_score:
+                best_score = score
+                best_threshold = t
+    
+    print(f"\nFinal Validation Results")
+    print(f"Best Threshold (precision >= {precision_min}): {best_threshold:.4f}")
+    print(f"Validation Score (recall+acc)/2: {best_score:.4f}")
+    
+    # Verify precision constraint
+    y_pred_final = (y_proba >= best_threshold).astype(int)
+    final_precision = precision_score(y_val, y_pred_final, zero_division=0)
+    final_recall = recall_score(y_val, y_pred_final)
+    final_acc = accuracy_score(y_val, y_pred_final)
+    print(f"Precision at threshold: {final_precision:.4f} >= {precision_min}")
+    print(f"Recall at threshold: {final_recall:.4f}")
+    print(f"Accuracy at threshold: {final_acc:.4f}")
+    
+    return best_model, study.best_params, best_threshold

@@ -8,8 +8,8 @@ import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.metrics import (
-    accuracy_score, confusion_matrix, f1_score, precision_score, 
-    recall_score, roc_auc_score, roc_curve
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, confusion_matrix, roc_curve, fbeta_score
 )
 from sklearn.model_selection import StratifiedKFold, GridSearchCV
 from sklearn.ensemble import GradientBoostingClassifier
@@ -187,13 +187,13 @@ def evaluate_generative_quality(df_synth_vis, feature_info, df_processed,
     
     fig, axes = plt.subplots(1, 3, figsize=(25, 8))
     
-    sns.heatmap(corr_real, annot=False, cmap='coolwarm', vmin=-1, vmax=1, center=0, ax=axes[0])
+    sns.heatmap(corr_real, annot=True, cmap='coolwarm', vmin=-1, vmax=1, center=0, ax=axes[0])
     axes[0].set_title('Correlation Matrix - Real Minority', fontsize=12)
     
-    sns.heatmap(corr_synth, annot=False, cmap='coolwarm', vmin=-1, vmax=1, center=0, ax=axes[1])
+    sns.heatmap(corr_synth, annot=True, cmap='coolwarm', vmin=-1, vmax=1, center=0, ax=axes[1])
     axes[1].set_title('Correlation Matrix - Synthetic', fontsize=12)
     
-    sns.heatmap(diff, annot=False, cmap='RdBu', center=0, ax=axes[2])
+    sns.heatmap(diff, annot=True, cmap='RdBu', center=0, ax=axes[2])
     axes[2].set_title('Correlation Difference (Real - Synthetic)', fontsize=12)
     
     plt.tight_layout()
@@ -201,28 +201,39 @@ def evaluate_generative_quality(df_synth_vis, feature_info, df_processed,
     plt.show()
 
     # =====================================================================
-    # 6. PCA / t‑SNE
+    # 6. PCA / t‑SNE - Side by Side (Compact)
     # =====================================================================
     print("Generating PCA/t‑SNE projections...")
+
+    # Prepare data
     X_min = np.vstack([df_processed[df_processed[target_col] == minority_label][num_cols].values,
-                       df_synth_vis[num_cols].values])
+                    df_synth_vis[num_cols].values])
     labels_vis = np.array(['Real'] * (df_processed[target_col] == minority_label).sum() + 
-                          ['Synthetic'] * len(df_synth_vis))
+                        ['Synthetic'] * len(df_synth_vis))
 
+    # Compute projections
     pca = PCA(n_components=2, random_state=42).fit_transform(X_min)
-    plt.figure(figsize=(8, 6))
-    sns.scatterplot(x=pca[:, 0], y=pca[:, 1], hue=labels_vis, alpha=0.7)
-    plt.title('PCA Projection')
-    plt.savefig(f'{save_path}/cwgan_pca.png', dpi=150, bbox_inches='tight')
-    plt.show()
-
     tsne = TSNE(n_components=2, random_state=42, perplexity=30).fit_transform(X_min)
-    plt.figure(figsize=(8, 6))
-    sns.scatterplot(x=tsne[:, 0], y=tsne[:, 1], hue=labels_vis, alpha=0.7)
-    plt.title('t‑SNE Projection')
-    plt.savefig(f'{save_path}/cwgan_tsne.png', dpi=150, bbox_inches='tight')
+
+    # Create side-by-side plots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Plot both
+    for ax, proj, title in [(ax1, pca, 'PCA'), (ax2, tsne, 't-SNE')]:
+        sns.scatterplot(x=proj[:, 0], y=proj[:, 1], hue=labels_vis, 
+                    alpha=0.6, ax=ax, palette=['#1f77b4', '#ff7f0e'], s=25)
+        ax.set_title(f'{title} Projection', fontsize=11, fontweight='bold')
+        ax.set_xlabel(f'{title} 1')
+        ax.set_ylabel(f'{title} 2')
+        ax.legend(title='Type', loc='best', fontsize=8)
+        ax.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    os.makedirs(f'{save_path}', exist_ok=True)
+    plt.savefig(f'{save_path}/cwgan_pca_tsne_combined.png', dpi=150, bbox_inches='tight')
     plt.show()
 
+    print(f"\n✓ Visualization complete! Saved to {save_path}/cwgan_pca_tsne_combined.png")
     # =====================================================================
     # 7. Comprehensive Quality Report
     # =====================================================================
@@ -329,14 +340,30 @@ def evaluate_generative_quality(df_synth_vis, feature_info, df_processed,
 
 
 # ======================================================================
-# Part 2: Predictive Performance Evaluation (XGBoost)
+# Part 2: Predictive Performance Evaluation (XGBoost) - UPDATED
 # ======================================================================
 
-def evaluate_classifier(model, X_test, y_test, model_name):
-    """Compute metrics, confusion matrix, and ROC curve."""
-    y_pred = model.predict(X_test)
+# ============================================================
+# Unified classifier evaluation
+# ============================================================
+def evaluate_classifier(model, X_test, y_test, model_name, threshold=None):
+    """
+    Compute metrics, confusion matrix, and ROC curve.
+    """
+
     y_proba = model.predict_proba(X_test)[:, 1]
 
+    # =====================================================
+    # Threshold handling
+    # =====================================================
+    if threshold is None:
+        threshold = 0.5
+
+    y_pred = (y_proba >= threshold).astype(int)
+
+    # =====================================================
+    # Metrics
+    # =====================================================
     metrics = {
         'Model': model_name,
         'AUC-ROC': roc_auc_score(y_test, y_proba),
@@ -346,46 +373,94 @@ def evaluate_classifier(model, X_test, y_test, model_name):
         'Accuracy': accuracy_score(y_test, y_pred)
     }
 
-    print(f"\n{'='*50}")
+    print("\n" + "="*60)
     print(f"{model_name} Performance")
-    print(f"{'='*50}")
+    print("="*60)
+
+    print(f"Threshold : {threshold:.4f}")
+
     for k, v in metrics.items():
         if k != 'Model':
-            print(f"  {k}: {v:.4f}")
+            print(f"{k:<12}: {v:.4f}")
 
+    # =====================================================
+    # Confusion Matrix
+    # =====================================================
     cm = confusion_matrix(y_test, y_pred)
-    plt.figure(figsize=(5, 4))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+
+    plt.figure(figsize=(5,4))
+
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt='d',
+        cmap='Blues'
+    )
+
     plt.title(f'Confusion Matrix - {model_name}')
     plt.xlabel('Predicted')
     plt.ylabel('Actual')
+
+    plt.tight_layout()
     plt.show()
 
+    # =====================================================
+    # ROC Curve
+    # =====================================================
     fpr, tpr, _ = roc_curve(y_test, y_proba)
-    plt.figure(figsize=(8, 6))
-    plt.plot(fpr, tpr, label=f'{model_name} (AUC = {metrics["AUC-ROC"]:.4f})', linewidth=2)
-    plt.plot([0, 1], [0, 1], 'k--', label='Random Classifier')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
+
+    plt.figure(figsize=(7,5))
+
+    plt.plot(
+        fpr,
+        tpr,
+        linewidth=2,
+        label=f'{model_name} (AUC = {metrics["AUC-ROC"]:.4f})'
+    )
+
+    plt.plot([0,1], [0,1], 'k--')
+
     plt.xlabel('False Positive Rate')
     plt.ylabel('True Positive Rate')
+
     plt.title(f'ROC Curve - {model_name}')
-    plt.legend(loc="lower right")
+
+    plt.legend()
     plt.grid(alpha=0.3)
+
+    plt.tight_layout()
     plt.show()
 
     return metrics, y_proba, y_pred
 
-
+# ============================================================
+# Model comparison (FIXED BUG: correct y_test handling)
+# ============================================================
 def compare_all_models(models_dict, save_path='../figures/model_comparison_xgb.png'):
-    """Compare multiple models and save results."""
+    """Compare multiple models with optional threshold tuning."""
+    
     all_metrics = []
     all_probas = {}
+    all_y_tests = {}  # Store y_test for each model
     
-    for name, (model, X_test, y_test) in models_dict.items():
-        metrics, y_proba, _ = evaluate_classifier(model, X_test, y_test, name)
+    # =========================
+    # Evaluate models
+    # =========================
+    for name, model_tuple in models_dict.items():
+        
+        if len(model_tuple) == 4:
+            model, X_test, y_test, threshold = model_tuple
+        else:
+            model, X_test, y_test = model_tuple
+            threshold = None
+        
+        metrics, y_proba, _ = evaluate_classifier(
+            model, X_test, y_test, name, threshold
+        )
+        
         all_metrics.append(metrics)
-        all_probas[name] = (y_proba, y_test)
+        all_probas[name] = y_proba
+        all_y_tests[name] = y_test  # Store y_test for each model
     
     results_df = pd.DataFrame(all_metrics).set_index('Model')
     
@@ -394,6 +469,9 @@ def compare_all_models(models_dict, save_path='../figures/model_comparison_xgb.p
     print("="*60)
     print(results_df.round(4).to_string())
     
+    # =========================
+    # Bar Plot
+    # =========================
     results_df.plot(kind='bar', figsize=(10, 6))
     plt.title('Model Performance Comparison (XGBoost)')
     plt.ylabel('Score')
@@ -404,14 +482,25 @@ def compare_all_models(models_dict, save_path='../figures/model_comparison_xgb.p
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
     
+    # =========================
+    # ROC Curve Comparison (FIXED: use each model's own y_test)
+    # =========================
     plt.figure(figsize=(8, 6))
     colors = ['blue', 'green', 'red', 'orange', 'purple']
-    for i, (name, (proba, y_test)) in enumerate(all_probas.items()):
-        fpr, tpr, _ = roc_curve(y_test, proba)
-        auc_val = roc_auc_score(y_test, proba)
-        plt.plot(fpr, tpr, label=f'{name} (AUC = {auc_val:.4f})', linewidth=2, color=colors[i % len(colors)])
     
-    plt.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Random Classifier')
+    for i, (name, proba) in enumerate(all_probas.items()):
+        y_test_model = all_y_tests[name]  # Get correct y_test for this model
+        fpr, tpr, _ = roc_curve(y_test_model, proba)
+        auc_val = roc_auc_score(y_test_model, proba)
+        
+        plt.plot(
+            fpr, tpr,
+            label=f'{name} (AUC = {auc_val:.4f})',
+            linewidth=2,
+            color=colors[i % len(colors)]
+        )
+    
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1)
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
     plt.xlabel('False Positive Rate')
@@ -424,19 +513,25 @@ def compare_all_models(models_dict, save_path='../figures/model_comparison_xgb.p
     plt.show()
     
     results_df.to_csv('../results/model_comparison_xgb.csv')
+    
     return results_df
 
-
-# ======================================================================
-# Part 3: SHAP Explainability
-# ======================================================================
+# ----------------------------------------------------------------------
+# Part 3: SHAP Explainability Evaluation
+# ----------------------------------------------------------------------  
 
 def shap_evaluation(model, X_sample, feature_names=None, save_path='../figures/shap'):
-    """Generate SHAP plots for a trained XGBoost model."""
-    import json
+    """
+    Generate SHAP plots for a trained XGBoost model.
+    - model: trained XGBoost classifier
+    - X_sample: DataFrame or numpy array of test samples (200-500 recommended)
+    """
+    # Fix base_score if needed
     if hasattr(model, 'base_score') and isinstance(model.base_score, str):
         model.base_score = float(model.base_score.strip("[]"))
+    # Patch internal booster config
     try:
+        import json
         booster = model.get_booster()
         config_str = booster.save_config()
         config = json.loads(config_str)
@@ -448,20 +543,34 @@ def shap_evaluation(model, X_sample, feature_names=None, save_path='../figures/s
                 base_val = float(base_val.strip("[]"))
             learner_model_param['base_score'] = str(base_val)
             booster.load_config(json.dumps(config))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Could not patch booster config: {e}")
 
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X_sample)
 
+    # Bar plot
     shap.summary_plot(shap_values, X_sample, plot_type="bar", feature_names=feature_names, show=False)
     plt.tight_layout()
     plt.savefig(f'{save_path}_bar.png', dpi=300, bbox_inches='tight')
     plt.show()
 
+    # Beeswarm plot
     shap.summary_plot(shap_values, X_sample, feature_names=feature_names, show=False)
     plt.tight_layout()
     plt.savefig(f'{save_path}_beeswarm.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # Waterfall plot for a high‑risk prediction
+    proba = model.predict_proba(X_sample)[:, 1]
+    high_risk_idx = np.argmax(proba)
+    shap.waterfall_plot(shap.Explanation(values=shap_values[high_risk_idx],
+                                         base_values=explainer.expected_value,
+                                         data=X_sample.iloc[high_risk_idx],
+                                         feature_names=feature_names))
+    plt.title('SHAP Waterfall - High Risk Sample')
+    plt.tight_layout()
+    plt.savefig(f'{save_path}_waterfall.png', dpi=300)
     plt.show()
 
     return explainer, shap_values
@@ -504,3 +613,7 @@ def wilcoxon_test(scores_a, scores_b):
     stat, p = wilcoxon(scores_a, scores_b)
     print(f"Wilcoxon test statistic: {stat:.4f}, p-value: {p:.4f}")
     return stat, p
+
+
+
+
